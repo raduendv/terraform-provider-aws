@@ -69,8 +69,8 @@ func resourceTable() *schema.Resource {
 			func(_ context.Context, diff *schema.ResourceDiff, meta any) error {
 				return validStreamSpec(diff)
 			},
-			func(_ context.Context, diff *schema.ResourceDiff, meta any) error {
-				return validateTableAttributes(diff)
+			func(ctx context.Context, diff *schema.ResourceDiff, meta any) error {
+				return validateTableAttributes(ctx, diff, meta)
 			},
 			func(_ context.Context, diff *schema.ResourceDiff, meta any) error {
 				if diff.Id() != "" && diff.HasChange("server_side_encryption") {
@@ -126,6 +126,28 @@ func resourceTable() *schema.Resource {
 				return old.(string) != new.(string) && new.(string) != ""
 			}),
 			validateTTLCustomDiff,
+			func(ctx context.Context, diff *schema.ResourceDiff, i interface{}) error {
+				rs := diff.GetRawState()
+				if rs.IsNull() {
+					return nil
+				}
+
+				keys := tfmaps.Keys(rs.AsValueMap())
+				total := 0
+
+				for _, k := range keys {
+					expected := k == "attribute"
+					if diff.HasChange(k) == expected {
+						total += 1
+					}
+				}
+
+				if total == len(keys) {
+					_ = diff.Clear("attribute")
+				}
+
+				return nil
+			},
 		),
 
 		SchemaVersion: 1,
@@ -168,6 +190,7 @@ func resourceTable() *schema.Resource {
 			"global_secondary_index": {
 				Type:     schema.TypeSet,
 				Optional: true,
+				Computed: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"hash_key": {
@@ -1057,6 +1080,36 @@ func resourceTableUpdate(ctx context.Context, d *schema.ResourceData, meta any) 
 
 		input.BillingMode = newBillingMode
 		input.ProvisionedThroughput = expandProvisionedThroughputUpdate(d.Id(), capacityMap, newBillingMode, oldBillingMode)
+
+		//table, err := findTableByName(ctx, conn, aws.ToString(input.TableName))
+		//if err == nil && table != nil {
+		//	for _, g := range table.GlobalSecondaryIndexes {
+		//		gsiUpdates = append(gsiUpdates, awstypes.GlobalSecondaryIndexUpdate{
+		//			Update: &awstypes.UpdateGlobalSecondaryIndexAction{
+		//				IndexName:             g.IndexName,
+		//				ProvisionedThroughput: input.ProvisionedThroughput,
+		//			},
+		//		})
+		//	}
+		//}
+		// @TODO: fix scenario when updating table from on demand to provisioned?
+		//var gsiu []awstypes.GlobalSecondaryIndexUpdate
+		//
+		//table, err := findTableByName(ctx, conn, aws.ToString(input.TableName))
+		//if err == nil && table != nil {
+		//	for _, g := range table.GlobalSecondaryIndexes {
+		//		gsiu = append(gsiu, awstypes.GlobalSecondaryIndexUpdate{
+		//			Update: &awstypes.UpdateGlobalSecondaryIndexAction{
+		//				IndexName:             g.IndexName,
+		//				ProvisionedThroughput: input.ProvisionedThroughput,
+		//			},
+		//		})
+		//	}
+		//}
+		//
+		//if len(gsiu) > 0 {
+		//	input.GlobalSecondaryIndexUpdates = gsiu
+		//}
 	}
 
 	if d.HasChange("deletion_protection_enabled") {
@@ -2762,7 +2815,9 @@ func expandS3BucketSource(data map[string]any) *awstypes.S3BucketSource {
 
 // validators
 
-func validateTableAttributes(d *schema.ResourceDiff) error {
+func validateTableAttributes(ctx context.Context, d *schema.ResourceDiff, meta any) error {
+	c := meta.(*conns.AWSClient)
+	conn := c.DynamoDBClient(ctx)
 	// Collect all indexed attributes
 	indexedAttributes := map[string]bool{}
 
@@ -2780,6 +2835,7 @@ func validateTableAttributes(d *schema.ResourceDiff) error {
 			indexedAttributes[rangeKey] = true
 		}
 	}
+
 	if v, ok := d.GetOk("global_secondary_index"); ok {
 		indexes := v.(*schema.Set).List()
 		for _, idx := range indexes {
@@ -2794,6 +2850,17 @@ func validateTableAttributes(d *schema.ResourceDiff) error {
 		}
 	}
 
+	// validate against remote as well, because we're using the remote state as a bridge between the table and gsi resources
+	remoteGSIAttributes := map[string]bool{}
+	if table, err := findTableByName(ctx, conn, d.Get(names.AttrName).(string)); err == nil && table != nil {
+		for _, g := range table.GlobalSecondaryIndexes {
+			for _, ks := range g.KeySchema {
+				remoteGSIAttributes[aws.ToString(ks.AttributeName)] = true
+				delete(indexedAttributes, aws.ToString(ks.AttributeName))
+			}
+		}
+	}
+
 	// Check if all indexed attributes have an attribute definition
 	attributes := d.Get("attribute").(*schema.Set).List()
 	unindexedAttributes := []string{}
@@ -2801,7 +2868,10 @@ func validateTableAttributes(d *schema.ResourceDiff) error {
 		attribute := attr.(map[string]any)
 		attrName := attribute[names.AttrName].(string)
 
-		if _, ok := indexedAttributes[attrName]; !ok {
+		_, ok1 := indexedAttributes[attrName]
+		_, ok2 := remoteGSIAttributes[attrName]
+
+		if !ok1 && !ok2 {
 			unindexedAttributes = append(unindexedAttributes, attrName)
 		} else {
 			delete(indexedAttributes, attrName)
