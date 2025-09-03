@@ -127,6 +127,46 @@ func resourceTable() *schema.Resource {
 			}),
 			validateTTLCustomDiff,
 			func(ctx context.Context, diff *schema.ResourceDiff, i interface{}) error {
+				var externalGSIs []string
+				_ = externalGSIs
+
+				if o, ok := diff.Get("external_global_secondary_indexes").(*schema.Set); ok && o != nil {
+					for _, e := range o.List() {
+						externalGSIs = append(externalGSIs, e.(string))
+					}
+				}
+
+				o, n := diff.GetChange("global_secondary_index")
+				os, osOk := o.(*schema.Set)
+				ns, nsOk := n.(*schema.Set)
+				if !osOk || !nsOk || o == nil || n == nil {
+					return nil
+				}
+
+				gsis := map[string]interface{}{}
+				for _, i := range os.List() {
+					m := i.(map[string]interface{})
+					n := m[names.AttrName].(string)
+
+					if slices.Contains(externalGSIs, n) {
+						gsis[n] = i
+					}
+				}
+
+				for _, i := range ns.List() {
+					m := i.(map[string]interface{})
+					n := m[names.AttrName].(string)
+
+					if _, found := gsis[n]; !found {
+						gsis[n] = i
+					}
+				}
+
+				diff.SetNew("global_secondary_index", tfmaps.Values(gsis))
+
+				return nil
+			},
+			func(ctx context.Context, diff *schema.ResourceDiff, i interface{}) error {
 				rs := diff.GetRawState()
 				if rs.IsNull() {
 					return nil
@@ -228,6 +268,11 @@ func resourceTable() *schema.Resource {
 						},
 					},
 				},
+			},
+			"external_global_secondary_indexes": {
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem:     &schema.Schema{Type: schema.TypeString},
 			},
 			"hash_key": {
 				Type:     schema.TypeString,
